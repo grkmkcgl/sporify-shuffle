@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Beğenilenleri Karıştır</title>
+<style>
+  :root {
+    --bg: #f6f6f4; --card: #ffffff; --text: #161616; --muted: #6b6b6b;
+    --line: #e4e4e0; --accent: #1db954; --accent-ink: #052e14; --err: #c0392b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0f1110; --card: #181b19; --text: #f0f0ee; --muted: #9a9e9b;
+            --line: #2a2e2b; --accent: #1ed760; --accent-ink: #04210f; --err: #ff6b5b; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 480px; margin: 0 auto; padding: 32px 16px 48px; }
+  h1 { font-size: 26px; margin: 0 0 4px; letter-spacing: -0.02em; }
+  .sub { color: var(--muted); margin: 0 0 24px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 16px;
+          padding: 20px; margin-bottom: 16px; }
+  label { display: block; font-size: 14px; font-weight: 600; margin: 0 0 6px; }
+  input { width: 100%; padding: 12px; border-radius: 10px; border: 1px solid var(--line);
+          background: var(--bg); color: var(--text); font-size: 16px; }
+  .field { margin-bottom: 14px; }
+  button { width: 100%; padding: 14px; border: 0; border-radius: 999px; font-size: 16px;
+           font-weight: 700; background: var(--accent); color: var(--accent-ink); cursor: pointer; }
+  button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line);
+                 font-weight: 500; margin-top: 10px; }
+  button:disabled { opacity: .5; cursor: default; }
+  .hint { font-size: 13px; color: var(--muted); margin-top: 8px; }
+  code { font-size: 13px; background: var(--bg); border: 1px solid var(--line);
+         padding: 2px 6px; border-radius: 6px; word-break: break-all; }
+  .bar { height: 8px; background: var(--line); border-radius: 99px; overflow: hidden; margin: 14px 0 8px; }
+  .bar > div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  #status { font-size: 14px; color: var(--muted); min-height: 21px; }
+  .err { color: var(--err) !important; }
+  .done a { color: var(--accent); font-weight: 700; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Beğenilenleri Karıştır</h1>
+  <p class="sub">Spotify'da beğendiğin tüm şarkıları rastgele sıraya dizip yeni bir çalma listesine koyar.</p>
+
+  <section id="setup" class="card">
+    <div class="field">
+      <label for="cid">Spotify Client ID</label>
+      <input id="cid" autocomplete="off" spellcheck="false" placeholder="ör. 3f1a…">
+    </div>
+    <p class="hint">Spotify uygulamanın ayarlarına Redirect URI olarak tam olarak bunu ekle:<br><code id="ruri"></code></p>
+    <button id="login" style="margin-top:12px">Spotify ile giriş yap</button>
+  </section>
+
+  <section id="app" class="card hidden">
+    <div class="field">
+      <label for="pname">Liste adı</label>
+      <input id="pname">
+    </div>
+    <button id="go">Karıştır ve liste oluştur</button>
+    <div class="bar"><div id="prog"></div></div>
+    <div id="status"></div>
+    <button id="logout" class="ghost">Çıkış yap</button>
+  </section>
+</main>
+
+<script>
+const API = 'https://api.spotify.com/v1';
+const SCOPES = 'user-library-read playlist-modify-private playlist-modify-public';
+const REDIRECT = location.origin + location.pathname;
+const $ = id => document.getElementById(id);
+
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+  del(k) { try { localStorage.removeItem(k); } catch {} },
+};
+
+$('ruri').textContent = REDIRECT;
+$('cid').value = store.get('sp_cid') || '';
+$('pname').value = 'Karışık Beğenilenler – ' + new Date().toLocaleDateString('tr-TR');
+
+function status(msg, isErr) {
+  $('status').textContent = msg;
+  $('status').classList.toggle('err', !!isErr);
+}
+function progress(p) { $('prog').style.width = Math.round(p * 100) + '%'; }
+
+// ---------- PKCE ----------
+function randStr(n) {
+  const a = new Uint8Array(n); crypto.getRandomValues(a);
+  return Array.from(a, b => ('0' + (b % 62).toString(36)).slice(-1)).join('') +
+         Array.from(a, b => b.toString(16).padStart(2, '0')).join('').slice(0, n);
+}
+async function challenge(verifier) {
+  const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(verifier));
+  return btoa(String.fromCharCode(...new Uint8Array(hash)))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+$('login').onclick = async () => {
+  const cid = $('cid').value.trim();
+  if (!cid) { $('cid').focus(); return; }
+  store.set('sp_cid', cid);
+  const verifier = randStr(64);
+  const state = randStr(16);
+  store.set('sp_verifier', verifier);
+  store.set('sp_state', state);
+  const q = new URLSearchParams({
+    client_id: cid, response_type: 'code', redirect_uri: REDIRECT,
+    code_challenge_method: 'S256', code_challenge: await challenge(verifier),
+    scope: SCOPES, state,
+  });
+  location.href = 'https://accounts.spotify.com/authorize?' + q;
+};
+
+async function tokenRequest(params) {
+  const r = await fetch('https://accounts.spotify.com/api/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams(params),
+  });
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error_description || j.error || 'Token alınamadı');
+  store.set('sp_token', j.access_token);
+  store.set('sp_expires', String(Date.now() + (j.expires_in - 60) * 1000));
+  if (j.refresh_token) store.set('sp_refresh', j.refresh_token);
+  return j.access_token;
+}
+
+async function getToken() {
+  const t = store.get('sp_token');
+  if (t && Date.now() < Number(store.get('sp_expires'))) return t;
+  const rt = store.get('sp_refresh');
+  if (!rt) throw new Error('Oturum süresi doldu, tekrar giriş yap.');
+  return tokenRequest({ grant_type: 'refresh_token', refresh_token: rt, client_id: store.get('sp_cid') });
+}
+
+// ---------- API ----------
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function api(path, opts = {}, tries = 0) {
+  const token = await getToken();
+  const r = await fetch(path.startsWith('http') ? path : API + path, {
+    ...opts,
+    headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json', ...(opts.headers || {}) },
+  });
+  if (r.status === 429 && tries < 5) {
+    const wait = Number(r.headers.get('Retry-After') || 2);
+    status(`Spotify yavaşlamamızı istedi, ${wait} sn bekleniyor…`);
+    await sleep(wait * 1000);
+    return api(path, opts, tries + 1);
+  }
+  if (r.status === 401 && tries < 1) {
+    store.del('sp_token');
+    return api(path, opts, tries + 1);
+  }
+  if (!r.ok) {
+    let msg = r.status + '';
+    try { msg = (await r.json()).error?.message || msg; } catch {}
+    if (r.status === 403) msg += ' — hesabının Spotify uygulamanda kullanıcı olarak ekli olduğundan ve Premium olduğundan emin ol.';
+    throw new Error(msg);
+  }
+  return r.status === 204 ? null : r.json();
+}
+
+function shuffle(a) {
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = crypto.getRandomValues(new Uint32Array(1))[0] % (i + 1);
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+$('go').onclick = async () => {
+  $('go').disabled = true; progress(0);
+  try {
+    // 1) Beğenilenleri topla
+    const uris = [];
+    let url = '/me/tracks?limit=50', total = 0;
+    while (url) {
+      const page = await api(url);
+      total = page.total;
+      for (const it of page.items) {
+        const t = it.track;
+        if (t && t.uri && t.uri.startsWith('spotify:track:')) uris.push(t.uri);
+      }
+      status(`Beğenilenler okunuyor: ${uris.length} / ${total}`);
+      progress(total ? 0.5 * uris.length / total : 0);
+      url = page.next;
+    }
+    if (!uris.length) { status('Beğenilen şarkı bulunamadı.', true); return; }
+
+    // 2) Karıştır
+    shuffle(uris);
+
+    // 3) Liste oluştur
+    status('Liste oluşturuluyor…');
+    const pl = await api('/me/playlists', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: $('pname').value.trim() || 'Karışık Beğenilenler',
+        public: false,
+        description: `${uris.length} beğenilen şarkı, rastgele sırayla.`,
+      }),
+    });
+
+    // 4) 100'erli gruplar halinde ekle
+    for (let i = 0; i < uris.length; i += 100) {
+      await api(`/playlists/${pl.id}/items`, {
+        method: 'POST',
+        body: JSON.stringify({ uris: uris.slice(i, i + 100) }),
+      });
+      const done = Math.min(i + 100, uris.length);
+      status(`Şarkılar ekleniyor: ${done} / ${uris.length}`);
+      progress(0.5 + 0.5 * done / uris.length);
+    }
+
+    progress(1);
+    const link = pl.external_urls?.spotify || `https://open.spotify.com/playlist/${pl.id}`;
+    $('status').classList.remove('err');
+    $('status').classList.add('done');
+    $('status').innerHTML = `Hazır! ${uris.length} şarkı eklendi. <a href="${link}" target="_blank" rel="noopener">Spotify'da aç →</a>`;
+  } catch (e) {
+    status('Hata: ' + e.message, true);
+  } finally {
+    $('go').disabled = false;
+  }
+};
+
+$('logout').onclick = () => {
+  ['sp_token', 'sp_expires', 'sp_refresh', 'sp_verifier', 'sp_state'].forEach(store.del);
+  location.replace(REDIRECT);
+};
+
+// ---------- Başlangıç ----------
+(async () => {
+  const p = new URLSearchParams(location.search);
+  if (p.get('error')) {
+    status('Giriş iptal edildi: ' + p.get('error'), true);
+    history.replaceState(null, '', REDIRECT);
+  } else if (p.get('code')) {
+    history.replaceState(null, '', REDIRECT);
+    if (p.get('state') !== store.get('sp_state')) {
+      alert('Güvenlik kontrolü başarısız, tekrar dene.');
+    } else {
+      try {
+        await tokenRequest({
+          grant_type: 'authorization_code', code: p.get('code'), redirect_uri: REDIRECT,
+          client_id: store.get('sp_cid'), code_verifier: store.get('sp_verifier'),
+        });
+      } catch (e) { alert('Giriş hatası: ' + e.message); }
+    }
+  }
+  const loggedIn = !!(store.get('sp_refresh') || store.get('sp_token'));
+  $('setup').classList.toggle('hidden', loggedIn);
+  $('app').classList.toggle('hidden', !loggedIn);
+})();
+</script>
+</body>
+</html>
